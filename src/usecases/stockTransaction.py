@@ -47,11 +47,15 @@ class StockTransaction:
         quantity = int(input("Quantity: "))
         total = quantity * price
 
+        # savepoint before any writes so we can roll back to here on failure
         with self.db.conn.cursor() as cursor:
             cursor.execute("SAVEPOINT before_purchase")
 
+        # reserve first — if two sessions try to buy simultaneously, the second
+        # one violates chk_reserved_lte_available and rolls back before the lock
         self.reserveStock(isin, quantity)
 
+        # row-level lock on the checking account, fails immediately if held by another session
         balance = self.lockCheckingAccount(checkingIban)
         if balance is None:
             self.db.conn.rollback()
@@ -154,7 +158,7 @@ class StockTransaction:
                 return row[0]
         except oracledb.DatabaseError as e:
             error = e.args[0]
-            if error.code == 54:
+            if error.code == 54:  # ORA-00054: resource busy
                 return None
             raise
 
@@ -174,6 +178,7 @@ class StockTransaction:
             with self.db.conn.cursor() as cursor:
                 stmtId = self.getOpenStatementId(checkingIban)
 
+                # RETURNING gives us the generated transaction_id for the FK in STOCK_TRANSACTION
                 transIdVar = cursor.var(oracledb.NUMBER)
                 cursor.execute(
                     """INSERT INTO TRANSACTIONS (transaction_id, valuta_date, amount, ts,
@@ -192,10 +197,13 @@ class StockTransaction:
                     {"tid": transId, "price": price, "qty": quantity, "isin": isin, "depot": depotIban}
                 )
 
+                # PK is (depot_iban, STOCK_isin, ACCOUNT_iban) — update date/price if position exists
                 cursor.execute(
                     """MERGE INTO DEPOT_POSITION dp
                        USING DUAL
-                       ON (dp.depot_iban = :depot AND dp.STOCK_isin = :isin AND dp.purchase_date = TRUNC(SYSDATE))
+                       ON (dp.depot_iban = :depot AND dp.STOCK_isin = :isin AND dp.ACCOUNT_iban = :depot)
+                       WHEN MATCHED THEN
+                           UPDATE SET purchase_date = TRUNC(SYSDATE), purchase_price = :price
                        WHEN NOT MATCHED THEN
                            INSERT (depot_iban, STOCK_isin, ACCOUNT_iban, purchase_date, purchase_price)
                            VALUES (:depot, :isin, :depot, TRUNC(SYSDATE), :price)""",

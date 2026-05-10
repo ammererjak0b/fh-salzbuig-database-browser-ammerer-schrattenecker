@@ -63,14 +63,17 @@ class BankTransfer:
         amount = float(input("Amount (EUR): "))
         transferText = input("Purpose: ")
 
+        # savepoint before any writes so we can roll back to here on failure
         with self.db.conn.cursor() as cursor:
             cursor.execute("SAVEPOINT before_transfer")
 
+        # row-level lock on source account, fails immediately if held by another session
         lockedBalance = self.lockSourceAccount(sourceIban)
         if lockedBalance is None:
             print("Account is locked by another session.")
             return
 
+        # savings accounts are only allowed to move funds to their linked checking account
         if sourceAccountType == "SPARKONTO":
             linkedIban = self.getLinkedIban(sourceIban)
             if targetIban != linkedIban:
@@ -78,6 +81,7 @@ class BankTransfer:
                 print(f"Savings account can only transfer to its linked checking account ({linkedIban}).")
                 return
 
+        # if target IBAN exists in our system it's internal (T), otherwise external payment (P)
         targetAccountType = self.getTargetAccountType(targetIban)
         isInternal = targetAccountType is not None
 
@@ -159,7 +163,7 @@ class BankTransfer:
                 return row[0]
         except oracledb.DatabaseError as e:
             error = e.args[0]
-            if error.code == 54:
+            if error.code == 54:  # ORA-00054: resource busy
                 return None
             raise
 
@@ -213,6 +217,7 @@ class BankTransfer:
                 )
                 srcTransId = int(transIdVar.getvalue()[0])
 
+                # external transfers get an additional row in PAYMENT_TRANSACTION
                 if not isInternal:
                     cursor.execute(
                         """INSERT INTO PAYMENT_TRANSACTION (transaction_id, target_iban, target_bic, target_account_iban)
@@ -233,6 +238,7 @@ class BankTransfer:
                     {"amount": amount, "stmtId": srcStmtId}
                 )
 
+                # internal transfers need a mirror transaction on the target side
                 if isInternal:
                     tgtStmtId = self.getOpenStatementId(targetIban)
 
