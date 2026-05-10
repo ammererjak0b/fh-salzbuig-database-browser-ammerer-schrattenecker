@@ -8,28 +8,66 @@ class BankTransfer:
 
     def run(self):
         customerId = int(input("Customer ID: "))
-        sourceIban = input("Source IBAN: ")
-        targetIban = input("Target IBAN: ")
-        targetBic = input("Target BIC (empty for internal): ")
-        amount = float(input("Amount (€): "))
-        transferText = input("Purpose: ")
 
-        sourceAccountType = self.getSourceAccount(customerId, sourceIban)
-        if sourceAccountType is None:
-            print("Account not found or does not belong to customer.")
+        customerAccounts = self.getCustomerAccounts(customerId)
+        if not customerAccounts:
+            print("No accounts found for this customer.")
             return
 
-        sourceAccountType = sourceAccountType.strip()
+        print("\nYour accounts:")
+        selectedSource = self.selectFromList(
+            customerAccounts,
+            lambda a: f"{a['iban']}  {a['accountType'].strip():<16}  Balance: {a['balance']} EUR"
+        )
+        if selectedSource is None:
+            print("Invalid selection.")
+            return
+
+        sourceIban = selectedSource["iban"]
+        sourceAccountType = selectedSource["accountType"].strip()
 
         if sourceAccountType == "AKTIENDEPOT":
             print("Cannot transfer from a stock depot.")
             return
 
+        print("\nTarget:")
+        print("  [1] Own account")
+        print("  [2] External IBAN")
+        targetChoice = input("Select: ").strip()
+
+        if targetChoice == "1":
+            ownTransferableAccounts = [
+                a for a in customerAccounts
+                if a["iban"] != sourceIban and a["accountType"].strip() != "AKTIENDEPOT"
+            ]
+            if not ownTransferableAccounts:
+                print("No other accounts available.")
+                return
+            print("\nTarget accounts:")
+            selectedTarget = self.selectFromList(
+                ownTransferableAccounts,
+                lambda a: f"{a['iban']}  {a['accountType'].strip()}"
+            )
+            if selectedTarget is None:
+                print("Invalid selection.")
+                return
+            targetIban = selectedTarget["iban"]
+            targetBic = ""
+        elif targetChoice == "2":
+            targetIban = input("Target IBAN: ")
+            targetBic = input("Target BIC: ")
+        else:
+            print("Invalid selection.")
+            return
+
+        amount = float(input("Amount (EUR): "))
+        transferText = input("Purpose: ")
+
         with self.db.conn.cursor() as cursor:
             cursor.execute("SAVEPOINT before_transfer")
 
-        balance = self.lockSourceAccount(sourceIban)
-        if balance is None:
+        lockedBalance = self.lockSourceAccount(sourceIban)
+        if lockedBalance is None:
             print("Account is locked by another session.")
             return
 
@@ -57,14 +95,14 @@ class BankTransfer:
 
         transType = "T" if isInternal else "P"
 
-        if balance < amount:
+        if lockedBalance < amount:
             self.db.conn.rollback()
-            print(f"Insufficient funds. Balance: {balance} €, Amount: {amount} €")
+            print(f"Insufficient funds. Balance: {lockedBalance} EUR, Amount: {amount} EUR")
             return
 
         print(f"\nFrom:    {sourceIban}")
         print(f"To:      {targetIban}")
-        print(f"Amount:  {amount} €")
+        print(f"Amount:  {amount} EUR")
         print(f"Purpose: {transferText}")
         confirm = input("Confirm? (y/n): ")
 
@@ -73,6 +111,29 @@ class BankTransfer:
             return
 
         self.executeTransfer(sourceIban, targetIban, targetBic, amount, transferText, transType, isInternal)
+        print(f"New balance: {lockedBalance - amount} EUR")
+
+    def selectFromList(self, items, labelFn):
+        for i, item in enumerate(items):
+            print(f"  [{i + 1}] {labelFn(item)}")
+        try:
+            choice = int(input("Select: ")) - 1
+        except ValueError:
+            return None
+        if choice < 0 or choice >= len(items):
+            return None
+        return items[choice]
+
+    def getCustomerAccounts(self, customerId):
+        with self.db.conn.cursor() as cursor:
+            cursor.execute(
+                """SELECT iban, account_type, balance FROM ACCOUNT
+                   WHERE customer_customer_id = :cid
+                   ORDER BY account_type, iban""",
+                {"cid": customerId}
+            )
+            rows = cursor.fetchall()
+            return [{"iban": row[0], "accountType": row[1], "balance": row[2]} for row in rows]
 
     def getSourceAccount(self, customerId, sourceIban):
         with self.db.conn.cursor() as cursor:

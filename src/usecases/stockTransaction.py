@@ -8,20 +8,43 @@ class StockTransaction:
 
     def run(self):
         customerId = int(input("Customer ID: "))
-        depotIban = input("Depot IBAN: ")
-        isin = input("Stock ISIN: ")
+
+        customerDepots = self.getCustomerDepots(customerId)
+        if not customerDepots:
+            print("No depot accounts found for this customer.")
+            return
+
+        print("\nYour depot accounts:")
+        selectedDepot = self.selectFromList(
+            customerDepots,
+            lambda d: f"{d['iban']}  (linked checking: {d['checkingIban']})"
+        )
+        if selectedDepot is None:
+            print("Invalid selection.")
+            return
+
+        depotIban = selectedDepot["iban"]
+        checkingIban = selectedDepot["checkingIban"]
+
+        availableStocks = self.getAvailableStocks()
+        if not availableStocks:
+            print("No stocks available for purchase.")
+            return
+
+        print("\nAvailable stocks:")
+        selectedStock = self.selectFromList(
+            availableStocks,
+            lambda s: f"{s['isin']}  {s['stockName']}  Price: {s['price']} EUR  Available: {s['availableQty']}"
+        )
+        if selectedStock is None:
+            print("Invalid selection.")
+            return
+
+        isin = selectedStock["isin"]
+        stockName = selectedStock["stockName"]
+        price = selectedStock["price"]
+
         quantity = int(input("Quantity: "))
-
-        checkingIban = self.getCheckingIban(customerId, depotIban)
-        if checkingIban is None:
-            print("Depot not found or does not belong to customer.")
-            return
-
-        price = self.getStockPrice(isin)
-        if price is None:
-            print("Stock not found or unavailable.")
-            return
-
         total = quantity * price
 
         with self.db.conn.cursor() as cursor:
@@ -37,14 +60,14 @@ class StockTransaction:
 
         if balance < total:
             self.db.conn.rollback()
-            print(f"Insufficient funds. Balance: {balance} €, Required: {total} €")
+            print(f"Insufficient funds. Balance: {balance} EUR, Required: {total} EUR")
             return
 
-        print(f"\nStock:    {isin}")
+        print(f"\nStock:    {isin}  {stockName}")
         print(f"Quantity: {quantity}")
-        print(f"Price:    {price} € per share")
-        print(f"Total:    {total} €")
-        print(f"Balance:  {balance} €")
+        print(f"Price:    {price} EUR per share")
+        print(f"Total:    {total} EUR")
+        print(f"Balance:  {balance} EUR")
         confirm = input("Confirm purchase? (y/n): ")
 
         if confirm.lower() != "y":
@@ -52,6 +75,39 @@ class StockTransaction:
             return
 
         self.executePurchase(checkingIban, depotIban, isin, quantity, price, total)
+        print(f"New balance: {balance - total} EUR")
+
+    def selectFromList(self, items, labelFn):
+        for i, item in enumerate(items):
+            print(f"  [{i + 1}] {labelFn(item)}")
+        try:
+            choice = int(input("Select: ")) - 1
+        except ValueError:
+            return None
+        if choice < 0 or choice >= len(items):
+            return None
+        return items[choice]
+
+    def getCustomerDepots(self, customerId):
+        with self.db.conn.cursor() as cursor:
+            cursor.execute(
+                """SELECT iban, ACCOUNT_iban FROM ACCOUNT
+                   WHERE customer_customer_id = :cid AND account_type = 'AKTIENDEPOT'
+                   ORDER BY iban""",
+                {"cid": customerId}
+            )
+            rows = cursor.fetchall()
+            return [{"iban": row[0], "checkingIban": row[1]} for row in rows]
+
+    def getAvailableStocks(self):
+        with self.db.conn.cursor() as cursor:
+            cursor.execute(
+                """SELECT isin, stock_name, price, available_quantity FROM STOCK
+                   WHERE available_quantity > 0
+                   ORDER BY isin"""
+            )
+            rows = cursor.fetchall()
+            return [{"isin": row[0], "stockName": row[1], "price": row[2], "availableQty": row[3]} for row in rows]
 
     def getCheckingIban(self, customerId, depotIban):
         with self.db.conn.cursor() as cursor:
