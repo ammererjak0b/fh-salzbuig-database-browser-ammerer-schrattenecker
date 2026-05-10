@@ -1,3 +1,4 @@
+import oracledb
 from db.database_helper import OracleDatabase
 
 
@@ -6,4 +7,199 @@ class BankTransfer:
         self.db = db
 
     def run(self):
-        print("Bank Transfer not implemented yet")
+        customerId = int(input("Customer ID: "))
+        sourceIban = input("Source IBAN: ")
+        targetIban = input("Target IBAN: ")
+        targetBic = input("Target BIC (empty for internal): ")
+        amount = float(input("Amount (€): "))
+        transferText = input("Purpose: ")
+
+        sourceAccountType = self.getSourceAccount(customerId, sourceIban)
+        if sourceAccountType is None:
+            print("Account not found or does not belong to customer.")
+            return
+
+        sourceAccountType = sourceAccountType.strip()
+
+        if sourceAccountType == "AKTIENDEPOT":
+            print("Cannot transfer from a stock depot.")
+            return
+
+        with self.db.conn.cursor() as cursor:
+            cursor.execute("SAVEPOINT before_transfer")
+
+        balance = self.lockSourceAccount(sourceIban)
+        if balance is None:
+            print("Account is locked by another session.")
+            return
+
+        if sourceAccountType == "SPARKONTO":
+            linkedIban = self.getLinkedIban(sourceIban)
+            if targetIban != linkedIban:
+                self.db.conn.rollback()
+                print(f"Savings account can only transfer to its linked checking account ({linkedIban}).")
+                return
+
+        targetAccountType = self.getTargetAccountType(targetIban)
+        isInternal = targetAccountType is not None
+
+        if isInternal:
+            if targetAccountType.strip() == "AKTIENDEPOT":
+                self.db.conn.rollback()
+                print("Cannot transfer to a stock depot.")
+                return
+            if targetAccountType.strip() == "SPARKONTO":
+                targetLinkedIban = self.getLinkedIban(targetIban)
+                if targetLinkedIban != sourceIban:
+                    self.db.conn.rollback()
+                    print("Cannot transfer to another customer's savings account.")
+                    return
+
+        transType = "T" if isInternal else "P"
+
+        if balance < amount:
+            self.db.conn.rollback()
+            print(f"Insufficient funds. Balance: {balance} €, Amount: {amount} €")
+            return
+
+        print(f"\nFrom:    {sourceIban}")
+        print(f"To:      {targetIban}")
+        print(f"Amount:  {amount} €")
+        print(f"Purpose: {transferText}")
+        confirm = input("Confirm? (y/n): ")
+
+        if confirm.lower() != "y":
+            self.db.conn.rollback()
+            return
+
+        self.executeTransfer(sourceIban, targetIban, targetBic, amount, transferText, transType, isInternal)
+
+    def getSourceAccount(self, customerId, sourceIban):
+        with self.db.conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT account_type FROM ACCOUNT WHERE iban = :iban AND CUSTOMER_customer_id = :cid",
+                {"iban": sourceIban, "cid": customerId}
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return row[0]
+
+    def lockSourceAccount(self, sourceIban):
+        try:
+            with self.db.conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT balance FROM ACCOUNT WHERE iban = :iban FOR UPDATE NOWAIT",
+                    {"iban": sourceIban}
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return None
+                return row[0]
+        except oracledb.DatabaseError as e:
+            error = e.args[0]
+            if error.code == 54:
+                return None
+            raise
+
+    def getLinkedIban(self, iban):
+        with self.db.conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT ACCOUNT_iban FROM ACCOUNT WHERE iban = :iban",
+                {"iban": iban}
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return row[0]
+
+    def getTargetAccountType(self, targetIban):
+        with self.db.conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT account_type FROM ACCOUNT WHERE iban = :iban",
+                {"iban": targetIban}
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return row[0]
+
+    def getOpenStatementId(self, iban):
+        with self.db.conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT statement_id FROM BANK_STATEMENT WHERE ACCOUNT_iban = :iban AND status = 'O' AND ROWNUM = 1",
+                {"iban": iban}
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return row[0]
+
+    def executeTransfer(self, sourceIban, targetIban, targetBic, amount, transferText, transType, isInternal):
+        try:
+            with self.db.conn.cursor() as cursor:
+                srcStmtId = self.getOpenStatementId(sourceIban)
+
+                transIdVar = cursor.var(oracledb.NUMBER)
+                cursor.execute(
+                    """INSERT INTO TRANSACTIONS (transaction_id, valuta_date, amount, ts, purpose,
+                       BANK_STATEMENT_statement_id, ACCOUNT_iban, transaction_type)
+                       VALUES (SEQ_TRANSACTION_ID.NEXTVAL, TRUNC(SYSDATE), :amount, SYSTIMESTAMP,
+                               :purpose, :stmtId, :iban, :type)
+                       RETURNING transaction_id INTO :tid""",
+                    {"amount": amount, "purpose": transferText, "stmtId": srcStmtId,
+                     "iban": sourceIban, "type": transType, "tid": transIdVar}
+                )
+                srcTransId = int(transIdVar.getvalue()[0])
+
+                if not isInternal:
+                    cursor.execute(
+                        """INSERT INTO PAYMENT_TRANSACTION (transaction_id, target_iban, target_bic, target_account_iban)
+                           VALUES (:tid, :tgtIban, :tgtBic, NULL)""",
+                        {"tid": srcTransId, "tgtIban": targetIban, "tgtBic": targetBic if targetBic else None}
+                    )
+
+                cursor.execute(
+                    "UPDATE ACCOUNT SET balance = balance - :amount WHERE iban = :iban",
+                    {"amount": amount, "iban": sourceIban}
+                )
+
+                cursor.execute(
+                    """UPDATE BANK_STATEMENT SET withdrawal_sum = withdrawal_sum + :amount,
+                       withdrawal_count = withdrawal_count + 1,
+                       ending_balance = ending_balance - :amount
+                       WHERE statement_id = :stmtId""",
+                    {"amount": amount, "stmtId": srcStmtId}
+                )
+
+                if isInternal:
+                    tgtStmtId = self.getOpenStatementId(targetIban)
+
+                    cursor.execute(
+                        """INSERT INTO TRANSACTIONS (transaction_id, valuta_date, amount, ts, purpose,
+                           BANK_STATEMENT_statement_id, ACCOUNT_iban, transaction_type)
+                           VALUES (SEQ_TRANSACTION_ID.NEXTVAL, TRUNC(SYSDATE), :amount, SYSTIMESTAMP,
+                                   :purpose, :stmtId, :iban, :type)""",
+                        {"amount": amount, "purpose": transferText, "stmtId": tgtStmtId,
+                         "iban": targetIban, "type": transType}
+                    )
+
+                    cursor.execute(
+                        "UPDATE ACCOUNT SET balance = balance + :amount WHERE iban = :iban",
+                        {"amount": amount, "iban": targetIban}
+                    )
+
+                    cursor.execute(
+                        """UPDATE BANK_STATEMENT SET deposit_sum = deposit_sum + :amount,
+                           deposit_count = deposit_count + 1,
+                           ending_balance = ending_balance + :amount
+                           WHERE statement_id = :stmtId""",
+                        {"amount": amount, "stmtId": tgtStmtId}
+                    )
+
+            self.db.conn.commit()
+            print("Transfer successful.")
+
+        except oracledb.DatabaseError as e:
+            self.db.conn.rollback()
+            print(f"Transfer failed: {e}")
