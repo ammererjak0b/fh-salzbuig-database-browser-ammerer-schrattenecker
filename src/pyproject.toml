@@ -1,0 +1,15 @@
+[tool.poetry]
+name = "fh-salzbuig-database-browser"
+version = "0.1.0"
+description = "Bank database console application - FH Salzburg DBS"
+authors = ["Jakob Ammerer", "Alex Schrattenecker"]
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.9"
+oracledb = "^1.2.2"
+pyyaml = "^6.0.1"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
